@@ -5,7 +5,7 @@ from datetime import datetime
 
 import pandas as pd
 import streamlit as st
-from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
@@ -82,7 +82,6 @@ NUMBER_COLUMNS = [
 def read_csv_robust(uploaded_file) -> pd.DataFrame:
     """Liest den Kisoft Auftragspool robust ein."""
     raw = uploaded_file.getvalue()
-
     encodings = ["utf-8-sig", "utf-8", "cp1252", "latin1"]
     last_error = None
 
@@ -125,7 +124,6 @@ def parse_number(value) -> float:
     if not text:
         return 0.0
 
-    # Beispiele: 1.234,50 oder 1234,50 oder 1234.50
     text = text.replace(" ", "")
     if "," in text and "." in text:
         text = text.replace(".", "").replace(",", ".")
@@ -161,20 +159,30 @@ def normalize_number_columns(df: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
-def add_rolli_column(df: pd.DataFrame) -> pd.DataFrame:
-    result = normalize_number_columns(df)
-    result["Anzahl Rolli"] = calculate_rolli(
-        result["Anzahl gepl. E2"],
-        result["Anzahl gepl. E1"],
-        result["Anzahl gepl. KARTON"],
-    ).apply(round_rolli_up)
-    return result
+def sort_key_series(series: pd.Series) -> pd.Series:
+    numeric = pd.to_numeric(series, errors="coerce")
+    return numeric.fillna(999999999).astype(float)
+
+
+def sort_result(df: pd.DataFrame) -> pd.DataFrame:
+    result = df.copy()
+    if "CSB Tournummer" in result.columns:
+        result["__tour_sort"] = sort_key_series(result["CSB Tournummer"])
+        sort_columns = ["__tour_sort", "CSB Tournummer"]
+        if "CSB Kundennummer" in result.columns:
+            result["__kunde_sort"] = sort_key_series(result["CSB Kundennummer"])
+            sort_columns.extend(["__kunde_sort", "CSB Kundennummer"])
+        result = result.sort_values(sort_columns, kind="mergesort")
+        result = result.drop(
+            columns=[column for column in ["__tour_sort", "__kunde_sort"] if column in result.columns]
+        )
+    return result.reset_index(drop=True)
 
 
 def prepare_data(df: pd.DataFrame):
     missing_columns = [column for column in REQUIRED_COLUMNS if column not in df.columns]
     if missing_columns:
-        return None, None, None, missing_columns
+        return None, None, missing_columns
 
     work = df[REQUIRED_COLUMNS].copy()
 
@@ -192,16 +200,11 @@ def prepare_data(df: pd.DataFrame):
         )[NUMBER_COLUMNS]
         .sum()
     )
+
     grouped["Anzahl Rolli"] = calculate_rolli(
         grouped["Anzahl gepl. E2"],
         grouped["Anzahl gepl. E1"],
         grouped["Anzahl gepl. KARTON"],
-    ).apply(round_rolli_up)
-
-    work["Anzahl Rolli"] = calculate_rolli(
-        work["Anzahl gepl. E2"],
-        work["Anzahl gepl. E1"],
-        work["Anzahl gepl. KARTON"],
     ).apply(round_rolli_up)
 
     overview = (
@@ -210,38 +213,20 @@ def prepare_data(df: pd.DataFrame):
         ]
         .sum()
     )
-    overview.insert(
-        1,
-        "Anzahl Kunden",
-        grouped.groupby("CSB Tournummer", dropna=False)["CSB Kundennummer"].nunique().values,
+    customer_counts = (
+        grouped.groupby("CSB Tournummer", dropna=False)["CSB Kundennummer"]
+        .nunique()
+        .reset_index(name="Anzahl Kunden")
     )
+    overview = overview.merge(customer_counts, on="CSB Tournummer", how="left")
+    overview = overview[
+        ["CSB Tournummer", "Anzahl Kunden"] + NUMBER_COLUMNS + ["Anzahl Rolli"]
+    ]
 
-    grouped = sort_result(grouped)
+    grouped = sort_result(grouped)[OUTPUT_COLUMNS]
     overview = sort_result(overview)
-    work = sort_result(work)
 
-    grouped = grouped[OUTPUT_COLUMNS]
-    work = work[OUTPUT_COLUMNS]
-
-    return grouped, overview, work, []
-
-
-def sort_key_series(series: pd.Series) -> pd.Series:
-    numeric = pd.to_numeric(series, errors="coerce")
-    return numeric.fillna(999999999).astype(float)
-
-
-def sort_result(df: pd.DataFrame) -> pd.DataFrame:
-    result = df.copy()
-    if "CSB Tournummer" in result.columns:
-        result["__tour_sort"] = sort_key_series(result["CSB Tournummer"])
-        sort_columns = ["__tour_sort", "CSB Tournummer"]
-        if "CSB Kundennummer" in result.columns:
-            result["__kunde_sort"] = sort_key_series(result["CSB Kundennummer"])
-            sort_columns.extend(["__kunde_sort", "CSB Kundennummer"])
-        result = result.sort_values(sort_columns, kind="mergesort")
-        result = result.drop(columns=[column for column in ["__tour_sort", "__kunde_sort"] if column in result.columns])
-    return result.reset_index(drop=True)
+    return grouped, overview, []
 
 
 def format_number_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -252,6 +237,8 @@ def format_number_columns(df: pd.DataFrame) -> pd.DataFrame:
             result[column] = result[column].round(0).astype(int)
     if "Anzahl Rolli" in result.columns:
         result["Anzahl Rolli"] = result["Anzahl Rolli"].fillna(0).astype(int)
+    if "Anzahl Kunden" in result.columns:
+        result["Anzahl Kunden"] = result["Anzahl Kunden"].fillna(0).astype(int)
     return result
 
 
@@ -308,7 +295,7 @@ def style_worksheet(worksheet):
                 cell.fill = header_fill
                 cell.font = header_font
 
-    for column_name in NUMBER_COLUMNS + ["Anzahl Rolli"]:
+    for column_name in NUMBER_COLUMNS + ["Anzahl Rolli", "Anzahl Kunden"]:
         for cell in worksheet[1]:
             if cell.value == column_name:
                 column_letter = get_column_letter(cell.column)
@@ -319,13 +306,12 @@ def style_worksheet(worksheet):
     add_filter_table(worksheet)
 
 
-def build_excel(grouped: pd.DataFrame, overview: pd.DataFrame, single_orders: pd.DataFrame) -> bytes:
+def build_excel(grouped: pd.DataFrame, overview: pd.DataFrame) -> bytes:
     output = io.BytesIO()
 
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         grouped.to_excel(writer, sheet_name="Kunden je CSB Tour", index=False)
         overview.to_excel(writer, sheet_name="Übersicht je CSB Tour", index=False)
-        single_orders.to_excel(writer, sheet_name="Einzelaufträge", index=False)
 
         for worksheet in writer.book.worksheets:
             style_worksheet(worksheet)
@@ -356,7 +342,7 @@ except Exception as error:
     st.error(str(error))
     st.stop()
 
-grouped_df, overview_df, single_orders_df, missing_columns = prepare_data(raw_df)
+grouped_df, overview_df, missing_columns = prepare_data(raw_df)
 
 if missing_columns:
     st.error("Die Datei enthält nicht alle benötigten Spalten.")
@@ -366,7 +352,7 @@ if missing_columns:
         st.write(list(raw_df.columns))
     st.stop()
 
-excel_bytes = build_excel(grouped_df, overview_df, single_orders_df)
+excel_bytes = build_excel(grouped_df, overview_df)
 file_date = datetime.now().strftime("%Y_%m_%d")
 
 left, middle, right, fourth = st.columns(4)
@@ -408,16 +394,9 @@ with st.expander("Übersicht je CSB Tour anzeigen", expanded=False):
         hide_index=True,
     )
 
-with st.expander("Einzelaufträge anzeigen", expanded=False):
-    st.dataframe(
-        format_number_columns(single_orders_df),
-        use_container_width=True,
-        hide_index=True,
-    )
-
 st.markdown(
     "<div class='small-note'>Berechnung Anzahl Rolli: "
     "(Anzahl gepl. E2 + 0,5 × Anzahl gepl. E1 + 0,5 × Anzahl gepl. KARTON) / 16 — danach auf volle Rollis aufgerundet. "
-    "Die Excel-Blätter sind als filterbare Tabellen formatiert.</div>",
+    "Die Excel-Blätter sind als filterbare Tabellen formatiert. Einzelaufträge werden nicht exportiert.</div>",
     unsafe_allow_html=True,
 )
