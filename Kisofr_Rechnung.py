@@ -10,6 +10,8 @@ from openpyxl.utils import get_column_letter
 
 
 ROLLI_TEILER = 16
+ROLLI_E1_FAKTOR = 0.25
+ROLLI_KARTON_FAKTOR = 1.29
 TKT_TEILER = 12.85
 
 TKT_SUFFIXE = {
@@ -103,7 +105,9 @@ def calculate_quantity(tournummer, e2, e1, karton) -> int:
     if is_tkt_tour(tournummer):
         return ceil_positive((e2 + e1 + karton) / TKT_TEILER)
 
-    return ceil_positive((e2 + (0.5 * e1) + (0.5 * karton)) / ROLLI_TEILER)
+    return ceil_positive(
+        (e2 + (ROLLI_E1_FAKTOR * e1) + (ROLLI_KARTON_FAKTOR * karton)) / ROLLI_TEILER
+    )
 
 
 def find_column(df: pd.DataFrame, candidates: list[str], required_name: str) -> str:
