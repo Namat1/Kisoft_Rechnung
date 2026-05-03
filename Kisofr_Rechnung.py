@@ -10,35 +10,35 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 
-# -----------------------------------------------------------------------------
-# Grundeinstellung
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Einstellung
+# =============================================================================
 st.set_page_config(
-    page_title="Auftragspool Auswertung",
+    page_title="Auftragspool",
     page_icon="📦",
-    layout="wide",
+    layout="centered",
 )
 
 st.markdown(
     """
     <style>
         .block-container {
-            padding-top: 1.2rem;
-            padding-bottom: 1.2rem;
-            max-width: 1500px;
+            max-width: 760px;
+            padding-top: 2rem;
+            padding-bottom: 2rem;
         }
-        h1, h2, h3 {
+        h1 {
+            font-size: 1.45rem;
             letter-spacing: -0.03em;
+            margin-bottom: 0.2rem;
         }
-        div[data-testid="stMetric"] {
-            background: #f7f7f8;
-            border: 1px solid #e5e7eb;
-            padding: 14px 16px;
-            border-radius: 14px;
+        [data-testid="stFileUploader"] {
+            padding: 0.2rem 0;
         }
-        .small-note {
-            color: #6b7280;
-            font-size: 0.92rem;
+        .stDownloadButton button {
+            height: 3rem;
+            font-weight: 700;
+            border-radius: 0.7rem;
         }
     </style>
     """,
@@ -46,9 +46,15 @@ st.markdown(
 )
 
 
-# -----------------------------------------------------------------------------
-# Spaltenlogik
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Feste Regeln
+# =============================================================================
+NUMBER_COLUMNS = [
+    "Anzahl gepl. E2",
+    "Anzahl gepl. E1",
+    "Anzahl gepl. KARTON",
+]
+
 OUTPUT_COLUMNS = [
     "CSB Tournummer",
     "Einheit",
@@ -62,16 +68,17 @@ OUTPUT_COLUMNS = [
     "Anzahl Rolli/TKT",
 ]
 
-NUMBER_COLUMNS = [
-    "Anzahl gepl. E2",
-    "Anzahl gepl. E1",
-    "Anzahl gepl. KARTON",
-]
-
 CALCULATED_COLUMN = "Anzahl Rolli/TKT"
 
-# TKT-Touren: Diese Nummern und Nummern mit gleichem Aufbau werden als TKT gerechnet.
-# Beispiel gleicher Aufbau: 12221, 22221, 32221 ... beziehungsweise 17779, 27779 ...
+# Rolli: E2 voll, E1 halb, KARTON halb, geteilt durch 16, danach aufrunden.
+ROLLI_DIVISOR = 16.0
+
+# TKT: E2 + E1 + KARTON, geteilt durch 12,85, danach aufrunden.
+# Der Faktor 12,85 ist so gewählt, dass diese drei Beispielmengen zusammen 320 TKT ergeben:
+# 1457/372/520 = 183, 521/124/202 = 66, 560/165/181 = 71.
+TKT_DIVISOR = 12.85
+
+# Diese Touren und Touren mit gleichem Aufbau werden als TKT gerechnet.
 TKT_EXACT_TOURS = {
     "12221",
     "12222",
@@ -105,10 +112,12 @@ COLUMN_ALIASES: Dict[str, List[str]] = {
 }
 
 
+# =============================================================================
+# Hilfsfunktionen
+# =============================================================================
 def normalize_column_name(value: object) -> str:
-    """Macht Spaltennamen vergleichbar, ohne die Originalspalten zu verändern."""
     text = str(value).replace("\ufeff", "").strip()
-    text = re.sub(r"\.\d+$", "", text)  # pandas-Zusatz bei doppelten Spaltennamen entfernen
+    text = re.sub(r"\.\d+$", "", text)
     text = text.replace("ß", "ss")
     text = re.sub(r"\s+", " ", text)
     return text.casefold()
@@ -138,11 +147,7 @@ def find_required_columns(df: pd.DataFrame) -> Tuple[Dict[str, str], List[str]]:
     return found, missing
 
 
-# -----------------------------------------------------------------------------
-# Lesen und Berechnen
-# -----------------------------------------------------------------------------
 def read_csv_robust(uploaded_file) -> pd.DataFrame:
-    """Liest den Kisoft Auftragspool robust ein."""
     raw = uploaded_file.getvalue()
     encodings = ["utf-8-sig", "utf-8", "cp1252", "latin1"]
     last_error = None
@@ -159,7 +164,7 @@ def read_csv_robust(uploaded_file) -> pd.DataFrame:
         except Exception as error:
             last_error = error
 
-    raise ValueError(f"Die Datei konnte nicht gelesen werden: {last_error}")
+    raise ValueError(f"Die CSV konnte nicht gelesen werden: {last_error}")
 
 
 def clean_text(value: object) -> str:
@@ -171,36 +176,14 @@ def clean_text(value: object) -> str:
     return text
 
 
-def clean_customer_number(value: object) -> str:
-    """Macht aus 12345.0 wieder 12345, lässt echte führende Nullen aber unverändert."""
+def clean_number_as_text(value: object) -> str:
     text = clean_text(value)
     if text.endswith(".0") and text[:-2].isdigit():
         return text[:-2]
     return text
 
 
-def normalize_tour_number(value: object) -> str:
-    """Bereitet die Tournummer für Regeln vor."""
-    text = clean_customer_number(value)
-    return re.sub(r"\D", "", text)
-
-
-def is_tkt_tour(value: object) -> bool:
-    """
-    Erkennt TKT-Touren.
-
-    Exakte Touren werden erkannt.
-    Zusätzlich wird der gleiche Aufbau erkannt: fünf Ziffern, erste Ziffer variabel,
-    die letzten vier Ziffern entsprechen einem bekannten TKT-Muster.
-    """
-    digits = normalize_tour_number(value)
-    if digits in TKT_EXACT_TOURS:
-        return True
-    return len(digits) == 5 and digits[1:] in TKT_SUFFIXES
-
-
 def parse_number(value: object) -> float:
-    """Wandelt deutsche und internationale Zahlenformate in Zahlen um."""
     text = clean_text(value)
     if not text:
         return 0.0
@@ -217,15 +200,22 @@ def parse_number(value: object) -> float:
         return 0.0
 
 
-def round_up_full(value: object) -> int:
-    """Rundet auf volle Einheiten auf. Null bleibt Null."""
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
+def normalize_tour_number(value: object) -> str:
+    text = clean_number_as_text(value)
+    return re.sub(r"\D", "", text)
+
+
+def is_tkt_tour(value: object) -> bool:
+    digits = normalize_tour_number(value)
+    if digits in TKT_EXACT_TOURS:
+        return True
+    return len(digits) == 5 and digits[1:] in TKT_SUFFIXES
+
+
+def round_up_full(value: float) -> int:
+    if value <= 0:
         return 0
-    if number <= 0:
-        return 0
-    return int(math.ceil(number))
+    return int(math.ceil(value))
 
 
 def sort_key(series: pd.Series) -> pd.Series:
@@ -235,41 +225,43 @@ def sort_key(series: pd.Series) -> pd.Series:
 
 def sort_result(df: pd.DataFrame) -> pd.DataFrame:
     result = df.copy()
-    if "CSB Tournummer" in result.columns:
-        result["__tour_sort"] = sort_key(result["CSB Tournummer"])
-        sort_columns = ["__tour_sort", "CSB Tournummer"]
-        if "CSB Kundennummer" in result.columns:
-            result["__kunde_sort"] = sort_key(result["CSB Kundennummer"])
-            sort_columns.extend(["__kunde_sort", "CSB Kundennummer"])
-        result = result.sort_values(sort_columns, kind="mergesort")
-        result = result.drop(columns=[column for column in ["__tour_sort", "__kunde_sort"] if column in result.columns])
-    return result.reset_index(drop=True)
+    result["__tour_sort"] = sort_key(result["CSB Tournummer"])
+    sort_columns = ["__tour_sort", "CSB Tournummer"]
+
+    if "CSB Kundennummer" in result.columns:
+        result["__kunde_sort"] = sort_key(result["CSB Kundennummer"])
+        sort_columns.extend(["__kunde_sort", "CSB Kundennummer"])
+
+    result = result.sort_values(sort_columns, kind="mergesort")
+    drop_columns = [column for column in ["__tour_sort", "__kunde_sort"] if column in result.columns]
+    return result.drop(columns=drop_columns).reset_index(drop=True)
 
 
 def calculate_unit_row(row: pd.Series) -> int:
-    e2 = row["Anzahl gepl. E2"]
-    e1 = row["Anzahl gepl. E1"]
-    karton = row["Anzahl gepl. KARTON"]
+    e2 = float(row["Anzahl gepl. E2"])
+    e1 = float(row["Anzahl gepl. E1"])
+    karton = float(row["Anzahl gepl. KARTON"])
 
     if row["Einheit"] == "TKT":
-        # TKT: alles voll addieren und durch 12 teilen.
-        return round_up_full((e2 + e1 + karton) / 12)
+        return round_up_full((e2 + e1 + karton) / TKT_DIVISOR)
 
-    # Rolli: E2 voll, E1 halb, KARTON halb, danach durch 16 teilen.
-    return round_up_full((e2 + e1 * 0.5 + karton * 0.5) / 16)
+    return round_up_full((e2 + e1 * 0.5 + karton * 0.5) / ROLLI_DIVISOR)
 
 
+# =============================================================================
+# Daten vorbereiten
+# =============================================================================
 def prepare_data(df: pd.DataFrame):
     found_columns, missing_columns = find_required_columns(df)
     if missing_columns:
-        return None, None, missing_columns, found_columns
+        return None, None, missing_columns
 
     work = pd.DataFrame({target: df[source] for target, source in found_columns.items()})
 
     for column in ["CSB Tournummer", "Kundenname", "Stadt", "Straße"]:
         work[column] = work[column].apply(clean_text)
 
-    work["CSB Kundennummer"] = work["CSB Kundennummer"].apply(clean_customer_number)
+    work["CSB Kundennummer"] = work["CSB Kundennummer"].apply(clean_number_as_text)
 
     for column in NUMBER_COLUMNS:
         work[column] = work[column].apply(parse_number)
@@ -288,6 +280,7 @@ def prepare_data(df: pd.DataFrame):
 
     grouped["Einheit"] = grouped["CSB Tournummer"].apply(lambda value: "TKT" if is_tkt_tour(value) else "Rolli")
     grouped[CALCULATED_COLUMN] = grouped.apply(calculate_unit_row, axis=1).astype(int)
+    grouped = sort_result(grouped)[OUTPUT_COLUMNS]
 
     overview = (
         grouped.groupby(["CSB Tournummer", "Einheit"], dropna=False, as_index=False)[NUMBER_COLUMNS + [CALCULATED_COLUMN]]
@@ -302,20 +295,18 @@ def prepare_data(df: pd.DataFrame):
 
     overview = overview.merge(customer_counts, on=["CSB Tournummer", "Einheit"], how="left")
     overview = overview[["CSB Tournummer", "Einheit", "Anzahl Kunden"] + NUMBER_COLUMNS + [CALCULATED_COLUMN]]
-
-    grouped = sort_result(grouped)[OUTPUT_COLUMNS]
     overview = sort_result(overview)
 
     for column in ["Anzahl Kunden"] + NUMBER_COLUMNS + [CALCULATED_COLUMN]:
         if column in overview.columns:
             overview[column] = overview[column].fillna(0).astype(int)
 
-    return grouped, overview, [], found_columns
+    return grouped, overview, []
 
 
-# -----------------------------------------------------------------------------
-# Excel-Erzeugung
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Excel erzeugen
+# =============================================================================
 def autosize_worksheet(worksheet) -> None:
     for column_cells in worksheet.columns:
         column_letter = get_column_letter(column_cells[0].column)
@@ -327,10 +318,6 @@ def autosize_worksheet(worksheet) -> None:
 
 
 def style_worksheet(worksheet) -> None:
-    """
-    Filter wird bewusst als normaler AutoFilter gesetzt.
-    Keine Excel-Tabellenobjekte, damit Excel keine Reparaturmeldung erzeugt.
-    """
     header_fill = PatternFill("solid", fgColor="1F2937")
     header_font = Font(color="FFFFFF", bold=True)
     even_fill = PatternFill("solid", fgColor="F9FAFB")
@@ -391,108 +378,36 @@ def build_excel(grouped: pd.DataFrame, overview: pd.DataFrame) -> bytes:
     return output.getvalue()
 
 
-def format_for_screen(df: pd.DataFrame) -> pd.DataFrame:
-    result = df.copy()
-    for column in NUMBER_COLUMNS + [CALCULATED_COLUMN, "Anzahl Kunden"]:
-        if column in result.columns:
-            result[column] = result[column].fillna(0).astype(int)
-    return result
-
-
-# -----------------------------------------------------------------------------
-# Oberfläche
-# -----------------------------------------------------------------------------
-st.title("Auftragspool Auswertung")
-st.caption("CSV hochladen, nach CSB Tournummer und Kunde zusammenfassen, Rolli oder TKT berechnen und Excel herunterladen.")
+# =============================================================================
+# Oberfläche: nur Hochladen und Herunterladen
+# =============================================================================
+st.title("Auftragspool")
 
 uploaded_file = st.file_uploader(
-    "Auftragspool CSV hochladen",
+    "CSV hochladen",
     type=["csv"],
-    help="Erwartet wird der Kisoft Auftragspool mit Semikolon als Trennzeichen.",
+    label_visibility="collapsed",
 )
 
-if not uploaded_file:
-    st.info("Bitte eine Auftragspool CSV hochladen.")
-    st.stop()
+if uploaded_file:
+    try:
+        raw_df = read_csv_robust(uploaded_file)
+        grouped_df, overview_df, missing_columns = prepare_data(raw_df)
 
-try:
-    raw_df = read_csv_robust(uploaded_file)
-except Exception as error:
-    st.error(str(error))
-    st.stop()
+        if missing_columns:
+            st.error("Diese Spalten fehlen: " + ", ".join(missing_columns))
+            st.stop()
 
-grouped_df, overview_df, missing_columns, found_columns = prepare_data(raw_df)
+        excel_bytes = build_excel(grouped_df, overview_df)
+        file_date = datetime.now().strftime("%Y_%m_%d")
 
-if missing_columns:
-    st.error("Die Datei enthält nicht alle benötigten Spalten.")
-    st.write("Fehlende Spalten:")
-    st.write(missing_columns)
-    with st.expander("Gefundene Spalten anzeigen"):
-        st.write(list(raw_df.columns))
-    st.stop()
+        st.download_button(
+            "Excel herunterladen",
+            data=excel_bytes,
+            file_name=f"Auftragspool_CSB_Tournummer_Kunden_Mengen_{file_date}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
 
-excel_bytes = build_excel(grouped_df, overview_df)
-file_date = datetime.now().strftime("%Y_%m_%d")
-
-rolli_sum = int(grouped_df.loc[grouped_df["Einheit"] == "Rolli", CALCULATED_COLUMN].sum())
-tkt_sum = int(grouped_df.loc[grouped_df["Einheit"] == "TKT", CALCULATED_COLUMN].sum())
-
-col1, col2, col3, col4, col5 = st.columns(5)
-col1.metric("Zeilen in CSV", f"{len(raw_df):,}".replace(",", "."))
-col2.metric("Kunden", f"{grouped_df['CSB Kundennummer'].nunique():,}".replace(",", "."))
-col3.metric("CSB Tournummern", f"{grouped_df['CSB Tournummer'].nunique():,}".replace(",", "."))
-col4.metric("Rollis gesamt", f"{rolli_sum:,}".replace(",", "."))
-col5.metric("TKT gesamt", f"{tkt_sum:,}".replace(",", "."))
-
-st.download_button(
-    "Excel herunterladen",
-    data=excel_bytes,
-    file_name=f"Auftragspool_CSB_Tournummer_Kunden_Mengen_Rolli_TKT_{file_date}.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    use_container_width=True,
-)
-
-st.divider()
-
-left, right = st.columns([2, 1])
-with left:
-    selected_tours = st.multiselect(
-        "CSB Tournummer filtern",
-        options=sorted(grouped_df["CSB Tournummer"].dropna().unique(), key=lambda x: (not str(x).isdigit(), str(x))),
-    )
-with right:
-    selected_units = st.multiselect(
-        "Einheit filtern",
-        options=["Rolli", "TKT"],
-        default=[],
-    )
-
-view_df = grouped_df.copy()
-if selected_tours:
-    view_df = view_df[view_df["CSB Tournummer"].isin(selected_tours)]
-if selected_units:
-    view_df = view_df[view_df["Einheit"].isin(selected_units)]
-
-st.subheader("Kunden je CSB Tour")
-st.dataframe(format_for_screen(view_df), use_container_width=True, hide_index=True)
-
-with st.expander("Übersicht je CSB Tour anzeigen", expanded=False):
-    st.dataframe(format_for_screen(overview_df), use_container_width=True, hide_index=True)
-
-with st.expander("TKT-Regel anzeigen", expanded=False):
-    st.write("Exakte TKT-Touren:")
-    st.write(sorted(TKT_EXACT_TOURS))
-    st.write("Zusätzlich TKT, wenn die Tournummer fünfstellig ist und nach der ersten Ziffer eines dieser Muster hat:")
-    st.write(sorted(TKT_SUFFIXES))
-
-with st.expander("Erkannte CSV-Spalten anzeigen", expanded=False):
-    st.write(found_columns)
-
-st.markdown(
-    "<div class='small-note'>Berechnung Rolli: "
-    "(Anzahl gepl. E2 + 0,5 × Anzahl gepl. E1 + 0,5 × Anzahl gepl. KARTON) / 16 — danach auf volle Rollis aufgerundet. "
-    "Berechnung TKT: (Anzahl gepl. E2 + Anzahl gepl. E1 + Anzahl gepl. KARTON) / 12 — danach auf volle TKT aufgerundet. "
-    "TKT-Touren werden über die exakten Tournummern und den gleichen Tournummer-Aufbau erkannt. "
-    "Die Excel-Datei nutzt normale Filter im Kopfbereich und keine Excel-Tabellenobjekte. Einzelaufträge werden nicht exportiert.</div>",
-    unsafe_allow_html=True,
-)
+    except Exception as error:
+        st.error(f"Fehler beim Verarbeiten: {error}")
